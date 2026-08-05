@@ -358,11 +358,10 @@ struct PopoverView: View {
             ])
 
             statGroup("SPEED", [
-                ("in the last hour", clearedText(.hour)),
-                ("in the last day",  clearedText(.day)),
-                ("in the last week", clearedText(.week)),
-            ], note: "Uploads run in bursts, so an idle minute is normal. "
-                   + "The daily figure is the one to trust.")
+                ("in the last hour", uploadedText(s.uploads.hour, 3600, s)),
+                ("in the last day",  uploadedText(s.uploads.day, 86400, s)),
+                ("in the last week", uploadedText(s.uploads.week, 604_800, s)),
+            ], note: speedNote(s))
 
             healthGroup(s)
         }
@@ -407,9 +406,28 @@ struct PopoverView: View {
         }
     }
 
-    private func clearedText(_ r: HistoryStore.Range) -> String {
-        guard let p = monitor.history.progress(r), p.cleared > 0 else { return "not measured yet" }
-        return "\(Fmt.bytes(p.cleared)) uploaded"
+    /// A window reaching further back than the sync engine's records is a partial total, and
+    /// saying "uploaded" for it would understate by however much history is missing.
+    private func uploadedText(_ bytes: Int64, _ window: TimeInterval, _ s: Snapshot) -> String {
+        // No coverage date means the read failed or the library keeps no outbound record.
+        // Reporting that as "nothing yet" states a confident zero on missing information.
+        guard let start = s.uploads.coverageStart else { return "not available" }
+        // Partial is decided before the zero case: an empty window with incomplete coverage is
+        // still incomplete, and "nothing yet" would read as a measurement.
+        let partial = Date().timeIntervalSince(start) < window
+        guard bytes > 0 else { return partial ? "no records this far back" : "nothing yet" }
+        return "\(Fmt.bytes(bytes)) uploaded" + (partial ? " (partial)" : "")
+    }
+
+    private func speedNote(_ s: Snapshot) -> String {
+        // Sized per asset from iCloud's acknowledgements, not per resource transfer, so these
+        // are throughput figures rather than an exact byte count. Say so.
+        let base = "Approximate. Uploads run in bursts, so an idle minute is normal. "
+                 + "The daily figure is the one to trust."
+        guard let start = s.uploads.coverageStart,
+              Date().timeIntervalSince(start) < 604_800 else { return base }
+        let f = DateFormatter(); f.dateFormat = "d MMM"
+        return base + " Marked partial where iCloud's records only go back to \(f.string(from: start))."
     }
 
     private func statGroup(_ title: String, _ rows: [(String, String)],

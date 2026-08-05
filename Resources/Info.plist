@@ -4,8 +4,8 @@
   <key>CFBundleName</key><string>Halo</string>
   <key>CFBundleDisplayName</key><string>Halo</string>
   <key>CFBundleIdentifier</key><string>app.airroom.halo</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>CFBundleShortVersionString</key><string>0.1</string>
+  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>0.1.1</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>Halo</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>

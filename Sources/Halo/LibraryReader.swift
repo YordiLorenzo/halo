@@ -154,6 +154,8 @@ enum LibraryReader {
         // footprint so the monitor never becomes the bottleneck it is reporting on.
         s.walBytes = fileSize(photosDB.appendingPathExtension("wal"))
 
+        s.uploads = uploadStats(library: library)
+
         s.daemonRunning = isRunning("cloudphotod")
         s.photosRunning = isRunning("Photos")
         s.wireOutBytes  = interfaceBytesOut()
@@ -206,6 +208,95 @@ enum LibraryReader {
 
     /// Full integrity check. Minutes on a large library, so this is only ever run when
     /// the user explicitly asks, never on the polling path.
+    /// What iCloud has confirmed receiving, per window, from the sync engine's own record.
+    ///
+    /// The alternative is watching the queue shrink, but that only measures the app's uptime:
+    /// on a fresh launch "last week" and "last day" hold the same few hours and print the same
+    /// number. `idMapping` is retroactive, so the figure is right the moment the app opens.
+    ///
+    /// `coverageStart` is the oldest mapping on file. The table does not always go back
+    /// forever, since a Photos library repair rebuilds it, so a window reaching further back
+    /// than this is reporting a partial total and the UI has to say so.
+    ///
+    /// A rebuild also remaps everything already in iCloud in one burst, and those rows carry
+    /// the rebuild's timestamp rather than the original upload's. Counting them would report
+    /// a library's worth of bytes as a single hour's throughput, so the opening burst is
+    /// dropped: genuine uploads trickle in, they do not arrive twelve thousand at once.
+    struct UploadStats {
+        var hour: Int64 = 0
+        var day: Int64 = 0
+        var week: Int64 = 0
+        var coverageStart: Date?
+    }
+
+    static func uploadStats(library: URL) -> UploadStats {
+        let cpl = library.appendingPathComponent(
+            "resources/cpl/cloudsync.noindex/storage/store.cloudphotodb")
+        let photos = library.appendingPathComponent("database/Photos.sqlite")
+        var out = UploadStats()
+        let now = Date().timeIntervalSince1970 - 978_307_200
+        let weekAgo = now - 604_800
+
+        withReadOnly(cpl) { db in
+            // Doubling apostrophes, because a library can legitimately live somewhere like
+            // /Volumes/Someone's Drive and an unescaped path makes ATTACH fail silently.
+            let quoted = photos.path.replacingOccurrences(of: "'", with: "''")
+            guard sqlite3_exec(db, "ATTACH DATABASE 'file:\(quoted)?mode=ro' AS p",
+                               nil, nil, nil) == SQLITE_OK else { return }
+
+            // Where the usable record starts. A rebuild remaps thousands of already-uploaded
+            // assets in one burst, so anything inside that burst is skipped. The burst has to
+            // be identified rather than assumed: a small library can legitimately finish its
+            // first batch within the same window, and a blanket cutoff would erase it.
+            var from = -Double.greatestFiniteMagnitude
+            query(db, """
+                SELECT MIN(addTimestamp),
+                       (SELECT count(*) FROM idMapping WHERE addDirection = 1
+                        AND addTimestamp < (SELECT MIN(addTimestamp) + 120 FROM idMapping
+                                            WHERE addDirection = 1))
+                FROM idMapping WHERE addDirection = 1
+            """) { row in
+                guard sqlite3_column_type(row, 0) != SQLITE_NULL else { return }
+                let first = sqlite3_column_double(row, 0)
+                let burst = sqlite3_column_int64(row, 1) > 500
+                from = burst ? first + 120 : first
+                out.coverageStart = Date(timeIntervalSince1970: from + 978_307_200)
+            }
+
+            // addDirection 1 is device to cloud. Without it, assets arriving *from* iCloud are
+            // counted as uploads, so a Mac doing an initial download reports large outbound
+            // figures while sending nothing.
+            //
+            // Resource type 0 with subtype above 1 is a locally generated preview that never
+            // occupies iCloud, matching the exclusion the library-size query already makes.
+            //
+            // Bounded to the widest window on display: this runs on every poll, and scanning
+            // the whole history each time is how a monitor starts holding read locks long
+            // enough to stop the WAL checkpointing.
+            let sql = """
+                SELECT COALESCE(SUM(CASE WHEN t > \(now - 3600)  THEN sz ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN t > \(now - 86400) THEN sz ELSE 0 END), 0),
+                       COALESCE(SUM(sz), 0)
+                FROM (SELECT m.addTimestamp t,
+                             (SELECT SUM(r.ZDATALENGTH) FROM p.ZINTERNALRESOURCE r
+                              JOIN p.ZASSET a ON a.Z_PK = r.ZASSET
+                              WHERE a.ZUUID = m.localIdentifier
+                                AND (r.ZRESOURCETYPE IN (1,4)
+                                     OR (r.ZRESOURCETYPE = 0 AND r.ZDATASTORESUBTYPE = 1))) sz
+                      FROM idMapping m
+                      WHERE m.addDirection = 1
+                        AND m.addTimestamp > \(weekAgo)
+                        AND m.addTimestamp >= \(from))
+            """
+            query(db, sql) { row in
+                out.hour = sqlite3_column_int64(row, 0)
+                out.day  = sqlite3_column_int64(row, 1)
+                out.week = sqlite3_column_int64(row, 2)
+            }
+        }
+        return out
+    }
+
     static func checkIntegrity(library: URL) -> Bool {
         var ok = true
         withReadOnly(library.appendingPathComponent("database/Photos.sqlite")) { db in

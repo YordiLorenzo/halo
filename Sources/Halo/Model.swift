@@ -22,6 +22,10 @@ enum Log {
 // MARK: - what one poll sees
 
 struct Snapshot {
+    /// Bytes iCloud has confirmed over each window, read from the sync engine's own record
+    /// rather than from watching the queue shrink, which only covers the app's uptime.
+    var uploads = LibraryReader.UploadStats()
+
     struct Kind: Identifiable { let kind: String; let files: Int; let bytes: Int64
                                 var id: String { kind } }
     let date: Date
