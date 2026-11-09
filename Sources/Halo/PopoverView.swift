@@ -141,6 +141,7 @@ struct PopoverView: View {
                 divider
                 riskNote(s)
             }
+            if case .failed = monitor.action { divider; actionFailure }
             if advanced { divider; advancedPanel(s) }
             divider
             actions(s)
@@ -205,10 +206,9 @@ struct PopoverView: View {
                     Spacer()
                     RangePicker(range: $monitor.range)
                 }
-                UploadBars(data: monitor.uploads,
+                UploadBars(data: monitor.history.drainSeries(monitor.range),
                            tint: monitor.phase == .stuck ? Palette.wait : Palette.go,
-                           unitLabel: monitor.range.barLabel,
-                           loading: monitor.chartLoading)
+                           bucketSeconds: monitor.range.bucketSeconds)
                 Text(progressLine)
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
@@ -218,24 +218,37 @@ struct PopoverView: View {
 
     /// Apple's own count of what landed in the window, no observation period needed.
     private var uploadedLabel: String {
-        let total = monitor.uploads.reduce(0) { $0 + $1.count }
+        let total = monitor.history.drainSeries(monitor.range).reduce(Int64(0)) { $0 + $1.bytes }
         guard total > 0 else { return "uploaded" }
-        return "\(Fmt.count(total)) uploaded"
+        return "\(Fmt.bytes(total)) uploaded"
     }
 
-    /// Prefer measured progress over the window; fall back to the instantaneous rate,
-    /// which is noisy on a bursty uploader and only meaningful when nothing else exists.
+    /// What cleared over the window shown in the chart, then how long the rest will take.
+    ///
+    /// The two use different rates on purpose. "Cleared" describes the bars above it, so it
+    /// follows the range buttons. The estimate does not: sync is bursty enough that an hour's
+    /// rate projects to anything from a day to never, and an estimate that changes when you
+    /// press a chart button is not an estimate. It always uses the last 24 hours, idle time
+    /// included, because idle time is part of how long this will really take.
     private var progressLine: String {
-        if let p = monitor.history.progress(monitor.range), p.cleared > 0 {
-            let hours = Double(monitor.snapshot?.queueBytes ?? 0) / max(p.perHour, 1)
-            let eta = hours > 48 ? String(format: "%.0f days left", hours / 24)
-                                 : String(format: "%.0f hours left", hours)
-            return "\(Fmt.bytes(p.cleared)) cleared in \(Fmt.duration(p.elapsed)) · \(eta) at this pace"
+        let cleared = monitor.history.progress(monitor.range).map {
+            "\(Fmt.bytes($0.cleared)) cleared in \(Fmt.duration($0.elapsed))"
         }
-        if let s = monitor.snapshot, let eta = Fmt.eta(s.queueBytes, monitor.bytesPerSecond) {
-            return eta
+        guard let parts = [cleared, dailyETA].compactMap({ $0 }).nonEmpty else {
+            return "measuring…"
         }
-        return "measuring…"
+        return parts.joined(separator: " · ")
+    }
+
+    /// Estimate from the last 24 hours of real drain. Nil until there is enough history to
+    /// say anything, rather than extrapolating from a few minutes.
+    private var dailyETA: String? {
+        guard let p = monitor.history.progress(.day), p.cleared > 0, p.elapsed > 3600,
+              let remaining = monitor.snapshot?.queueBytes, remaining > 0 else { return nil }
+        let hours = Double(remaining) / max(p.perHour, 1)
+        let eta = hours > 48 ? String(format: "%.0f days left", hours / 24)
+                             : String(format: "%.0f hours left", hours)
+        return p.elapsed < 82_800 ? "\(eta), partial day" : eta
     }
 
     private func breakdownBlock(_ s: Snapshot) -> some View {
@@ -259,10 +272,25 @@ struct PopoverView: View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 12)).foregroundStyle(monitor.phase.tint).frame(width: 16)
-            Text(problemText(s)).font(.system(size: 12.5)).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(problemText(s)).font(.system(size: 12.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if monitor.phase == .stuck { autoRestartToggle }
+            }
         }
         .padding(.horizontal, 18).padding(.vertical, 14)
+    }
+
+    /// Offered inside the stall message, which is the one moment it is obviously relevant.
+    private var autoRestartToggle: some View {
+        Toggle(isOn: $monitor.autoRestart) {
+            Text(monitor.autoRestarts > 0
+                 ? "Restart automatically · done \(monitor.autoRestarts)× so far"
+                 : "Restart automatically when this happens")
+                .font(.system(size: 12))
+        }
+        .toggleStyle(.checkbox)
+        .foregroundStyle(.secondary)
     }
 
     private func problemText(_ s: Snapshot) -> String {
@@ -315,17 +343,19 @@ struct PopoverView: View {
 
     private func actions(_ s: Snapshot) -> some View {
         HStack(spacing: 6) {
-            switch monitor.phase {
-            case .stuck:
-                Pill(title: "Restart backup", tint: Palette.go) { monitor.restartBackup() }
-            case .broken where !s.daemonRunning:
-                Pill(title: "Restart backup service", tint: Palette.stop) { monitor.restartService() }
-            case .backingUp:
-                Pill(title: "Open Photos") { monitor.openPhotos() }
-            default:
-                Pill(title: "Check a folder") { monitor.chooseFolder() }
+            switch monitor.action {
+            case .running(let what):
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.small).scaleEffect(0.8)
+                    Text(what + "…").font(.system(size: 12.5)).foregroundStyle(.secondary)
+                }
+            case .failed:
+                EmptyView()      // the message row above carries it
+            case .idle:
+                actionButton(s)
             }
             Spacer()
+
             Pill(title: advanced ? "Less" : "Details", quiet: true) {
                 withAnimation(.easeInOut(duration: 0.18)) { advanced.toggle() }
             }
@@ -357,11 +387,23 @@ struct PopoverView: View {
                 ("total size",        Fmt.bytes(s.libraryBytes)),
             ])
 
+            VStack(alignment: .leading, spacing: 5) {
+                Text("WHEN IT STALLS").font(.system(size: 9.5, weight: .bold)).kerning(0.6)
+                    .foregroundStyle(.tertiary)
+                autoRestartToggle
+                Text("Presses Pause and Resume in Photos for you, at most once every "
+                   + "five minutes. Needs Accessibility and Automation permission.")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.bottom, 4)
+
             statGroup("SPEED", [
-                ("in the last hour", uploadedText(s.uploads.hour, 3600, s)),
-                ("in the last day",  uploadedText(s.uploads.day, 86400, s)),
-                ("in the last week", uploadedText(s.uploads.week, 604_800, s)),
-            ], note: speedNote(s))
+                ("in the last hour", drainText(.hour)),
+                ("in the last day",  drainText(.day)),
+                ("in the last week", drainText(.week)),
+            ], note: "Measured by what actually left the upload queue. "
+                   + "Uploads run in bursts, so an idle minute is normal.")
 
             healthGroup(s)
         }
@@ -375,9 +417,12 @@ struct PopoverView: View {
             Text("HEALTH").font(.system(size: 9.5, weight: .bold)).kerning(0.6)
                 .foregroundStyle(.tertiary)
 
-            healthRow(ok: s.daemonRunning,
+            // "Running" while the header says stuck reads as the app disagreeing with itself.
+            // The daemon being alive is not the same as it doing anything.
+            healthRow(ok: s.daemonRunning && monitor.phase != .stuck,
                       good: "Upload service is running",
-                      bad: "Upload service has stopped")
+                      bad: s.daemonRunning ? "Upload service is idle and not sending anything"
+                                           : "Upload service has stopped")
 
             healthRow(ok: s.walBytes < 100_000_000,
                       good: "Library database is healthy",
@@ -406,28 +451,59 @@ struct PopoverView: View {
         }
     }
 
-    /// A window reaching further back than the sync engine's records is a partial total, and
-    /// saying "uploaded" for it would understate by however much history is missing.
-    private func uploadedText(_ bytes: Int64, _ window: TimeInterval, _ s: Snapshot) -> String {
-        // No coverage date means the read failed or the library keeps no outbound record.
-        // Reporting that as "nothing yet" states a confident zero on missing information.
-        guard let start = s.uploads.coverageStart else { return "not available" }
-        // Partial is decided before the zero case: an empty window with incomplete coverage is
-        // still incomplete, and "nothing yet" would read as a measurement.
-        let partial = Date().timeIntervalSince(start) < window
-        guard bytes > 0 else { return partial ? "no records this far back" : "nothing yet" }
-        return "\(Fmt.bytes(bytes)) uploaded" + (partial ? " (partial)" : "")
+    /// Bytes that actually left the queue over the window.
+    ///
+    /// This is the same measurement the headline uses, deliberately. An estimate derived from
+    /// iCloud's per-asset acknowledgements was tried here and disagreed with the queue by 20%
+    /// on the same window, which put two different answers to one question on screen at once.
+    /// The queue is the one that is definitionally right: a file leaves it when it is sent.
+    ///
+    /// The cost is that it only knows about time Halo was running, so a window it cannot cover
+    /// says so rather than quietly reporting a shorter period's total.
+    private func drainText(_ r: HistoryStore.Range) -> String {
+        guard let p = monitor.history.progress(r) else { return "not measured yet" }
+        guard p.cleared > 0 else { return "nothing" }
+        let covered = p.elapsed > r.seconds * 0.9
+        return "\(Fmt.bytes(p.cleared)) uploaded"
+             + (covered ? "" : " in \(Fmt.duration(p.elapsed))")
     }
 
-    private func speedNote(_ s: Snapshot) -> String {
-        // Sized per asset from iCloud's acknowledgements, not per resource transfer, so these
-        // are throughput figures rather than an exact byte count. Say so.
-        let base = "Approximate. Uploads run in bursts, so an idle minute is normal. "
-                 + "The daily figure is the one to trust."
-        guard let start = s.uploads.coverageStart,
-              Date().timeIntervalSince(start) < 604_800 else { return base }
-        let f = DateFormatter(); f.dateFormat = "d MMM"
-        return base + " Marked partial where iCloud's records only go back to \(f.string(from: start))."
+    @ViewBuilder private func actionButton(_ s: Snapshot) -> some View {
+        switch monitor.phase {
+        case .stuck:
+            Pill(title: "Restart backup", tint: Palette.go) { monitor.restartBackup() }
+        case .broken where !s.daemonRunning:
+            // The daemon is launch-on-demand and SIP refuses launchctl kickstart, so opening
+            // Photos is the only thing that actually starts it.
+            Pill(title: "Open Photos", tint: Palette.stop) { monitor.openPhotos() }
+        case .backingUp:
+            Pill(title: "Open Photos") { monitor.openPhotos() }
+        default:
+            Pill(title: "Check a folder") { monitor.chooseFolder() }
+        }
+    }
+
+    /// Shown when an action failed, with the one control that resolves it.
+    @ViewBuilder private var actionFailure: some View {
+        if case .failed(let message, let canFix) = monitor.action {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12)).foregroundStyle(Palette.wait).frame(width: 16)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(message).font(.system(size: 12.5)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        if canFix {
+                            Pill(title: "Open Accessibility settings", tint: Palette.go) {
+                                monitor.openAccessibilitySettings()
+                            }
+                        }
+                        Pill(title: "Dismiss", quiet: true) { monitor.dismissAction() }
+                    }
+                }
+            }
+            .padding(.horizontal, 18).padding(.vertical, 12)
+        }
     }
 
     private func statGroup(_ title: String, _ rows: [(String, String)],

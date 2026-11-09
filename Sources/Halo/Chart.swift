@@ -9,10 +9,10 @@ import SwiftUI
 /// work. The shape immediately shows the thing that matters on a slow connection, that
 /// almost everything happens overnight while the Mac is idle.
 struct UploadBars: View {
-    let data: [(date: Date, count: Int)]
+    let data: [(date: Date, bytes: Int64)]
     var tint: Color = Palette.go
-    var unitLabel: String = "hour"
-    var loading: Bool = false
+    /// How wide one bar is, so the hover label can name the right precision.
+    var bucketSeconds: Int = 3600
 
     @State private var hover: Int? = nil
 
@@ -26,13 +26,15 @@ struct UploadBars: View {
                 .frame(height: 13)
 
             GeometryReader { geo in
-                if data.count >= 2 {
-                    let peak = max(data.map(\.count).max() ?? 1, 1)
+                // One bar is still a bar. Requiring two put "no uploads recorded yet" under a
+                // header that was simultaneously counting them.
+                if !data.isEmpty {
+                    let peak = max(data.map(\.bytes).max() ?? 1, 1)
                     HStack(alignment: .bottom, spacing: 1.5) {
                         ForEach(Array(data.enumerated()), id: \.offset) { i, d in
-                            let h = max(2, geo.size.height * logFraction(d.count, peak))
+                            let h = max(2, geo.size.height * logFraction(d.bytes, peak))
                             RoundedRectangle(cornerRadius: 1.5)
-                                .fill(barColor(i, d.count, peak))
+                                .fill(barColor(i, d.bytes, peak))
                                 .frame(height: h)
                                 .contentShape(Rectangle())
                                 .onHover { inside in hover = inside ? i : (hover == i ? nil : hover) }
@@ -40,43 +42,36 @@ struct UploadBars: View {
                     }
                     .frame(maxHeight: .infinity, alignment: .bottom)
                 } else {
-                    Text("no uploads recorded yet")
+                    Text("not measured yet")
                         .font(.system(size: 11)).foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
             .frame(height: 50)
-            .opacity(loading ? 0.25 : 1)
-            .overlay {
-                if loading {
-                    ProgressView().controlSize(.small)
-                }
-            }
-            .animation(.easeOut(duration: 0.15), value: loading)
         }
     }
 
     /// Log scale. Upload volume is wildly bursty, an overnight hour can be 2,400 items
     /// against 14 in the afternoon, so on a linear axis every quiet period flattens to
     /// nothing and the chart reads as "dead" when it isn't.
-    private func logFraction(_ count: Int, _ peak: Int) -> Double {
-        guard count > 0 else { return 0 }
-        return log(Double(count) + 1) / log(Double(peak) + 1)
+    private func logFraction(_ v: Int64, _ peak: Int64) -> Double {
+        guard v > 0 else { return 0 }
+        return log(Double(v) + 1) / log(Double(peak) + 1)
     }
 
-    private func barColor(_ i: Int, _ count: Int, _ peak: Int) -> Color {
+    private func barColor(_ i: Int, _ v: Int64, _ peak: Int64) -> Color {
         if hover == i { return tint }
-        if count == 0 { return tint.opacity(0.16) }
-        return tint.opacity(0.34 + logFraction(count, peak) * 0.5)
+        if v == 0 { return tint.opacity(0.16) }
+        return tint.opacity(0.34 + logFraction(v, peak) * 0.5)
     }
 
     private var hoverText: String {
         guard let i = hover, data.indices.contains(i) else { return " " }
         let d = data[i]
         let f = DateFormatter()
-        f.dateFormat = unitLabel == "minute" ? "HH:mm"
-                     : unitLabel == "hour"   ? "EEE HH:mm" : "EEE d MMM, HH:mm"
-        return "\(f.string(from: d.date))  ·  \(d.count.formatted()) uploaded"
+        f.dateFormat = bucketSeconds < 3600 ? "HH:mm"
+                     : bucketSeconds <= 3600 ? "EEE HH:mm" : "EEE d MMM, HH:mm"
+        return "\(f.string(from: d.date))  ·  \(Fmt.bytes(d.bytes)) uploaded"
     }
 }
 

@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Yordi de Kleijn
 
 import Foundation
+import ApplicationServices
+import AppKit
 import SwiftUI
 
 /// Development log. An LSUIElement app has no console, so trace to a file.
@@ -22,9 +24,9 @@ enum Log {
 // MARK: - what one poll sees
 
 struct Snapshot {
-    /// Bytes iCloud has confirmed over each window, read from the sync engine's own record
-    /// rather than from watching the queue shrink, which only covers the app's uptime.
-    var uploads = LibraryReader.UploadStats()
+    /// cloudphotod's CPU share. The only liveness signal here that is actually Photos'.
+    var daemonCPU: Double?
+
 
     struct Kind: Identifiable { let kind: String; let files: Int; let bytes: Int64
                                 var id: String { kind } }
@@ -115,22 +117,19 @@ final class Monitor: ObservableObject {
     /// Sync is bursty, it goes quiet between batches, and satellite links drop out for
     /// seconds at a time. Declaring a stall from one idle sample is how a monitor cries
     /// wolf and gets muted. Only sustained silence counts.
-    private static let stallAfter: TimeInterval = 180
+    ///
+    /// Ten minutes, not three: a single large video can hold the queue flat for minutes
+    /// while genuinely transferring, and the daemon's CPU covers that case, but the two
+    /// together still need slack for a slow link.
+    private static let stallAfter: TimeInterval = 600
 
     @Published private(set) var snapshot: Snapshot?
     @Published private(set) var phase: Phase = .unknown
     @Published private(set) var bytesPerSecond: Double = 0
     @Published private(set) var history = HistoryStore.load()
-    /// Apple's own record of what landed and when, retroactive, so the chart is full
-    /// the first time the app opens.
-    @Published private(set) var uploads: [(date: Date, count: Int)] = []
     @Published var range: HistoryStore.Range = .day {
-        didSet { if oldValue != range { loadChart() } }
+        didSet { objectWillChange.send() }
     }
-    /// Set while the chart is being re-read. Usually ~50 ms, but the read waits on the
-    /// same lock sync is writing through, so under load it is long enough to look broken
-    /// without something on screen saying otherwise.
-    @Published private(set) var chartLoading = false
     @Published private(set) var library: URL?
     @Published var report: FolderReport?
     @Published var verifying = false
@@ -139,13 +138,26 @@ final class Monitor: ObservableObject {
     /// changes, so formatting there burns CPU for no reason.
     @Published private(set) var menuBarLabel: String?
 
+    /// What a button is doing, so the UI can say so. Fire-and-forget actions that take ten
+    /// seconds and report nothing read as a broken button.
+    enum ActionState: Equatable {
+        case idle
+        case running(String)
+        case failed(String, canFix: Bool)
+    }
+    @Published private(set) var action: ActionState = .idle
+
     private var previous: Snapshot?
     /// Guards against overlapping polls. Without it a slow snapshot lets the next timer
     /// fire on top of it; the tasks stack, each opens its own connections, and the read
     /// locks pile up, the exact pattern that stops SQLite checkpointing the WAL.
     private var polling = false
-    private var loadingChart = false
     private var lastProgressAt = Date()
+    /// Auto-restart bookkeeping. Cooldown so a sync that dies immediately after a restart
+    /// cannot turn this into a loop that clicks Photos every few seconds.
+    private var lastAutoRestart = Date.distantPast
+    @AppStorage("autoRestart") var autoRestart = false
+    @Published private(set) var autoRestarts = 0
     private var timer: Timer?
     private var popoverOpen = false
 
@@ -229,35 +241,9 @@ final class Monitor: ObservableObject {
         Task.detached(priority: .utility) {
             let snap = LibraryReader.snapshot(library: lib)
             Log.write("snapshot queue=\(snap.queueBytes) files=\(snap.queueFiles) lib=\(snap.libraryBytes)")
-            let bucket = await self.range.bucket
-            let hist = LibraryReader.uploadHistory(library: lib, bucket: bucket)
             await MainActor.run {
                 self.polling = false
-                self.uploads = hist
                 self.apply(snap)
-            }
-        }
-    }
-
-    /// Chart-only reload, for switching the range.
-    ///
-    /// Deliberately not `refresh()`: that reads the whole library snapshot and bails
-    /// outright when a poll is in flight, so a range switch could do nothing at all and
-    /// leave the old range's bars on screen under the new label.
-    func loadChart() {
-        guard let lib = library, !loadingChart else { return }
-        loadingChart = true
-        chartLoading = true
-        let wanted = range
-        Task.detached(priority: .userInitiated) {
-            let hist = LibraryReader.uploadHistory(library: lib, bucket: wanted.bucket)
-            await MainActor.run {
-                self.loadingChart = false
-                // Clicking through the ranges faster than the reads return would otherwise
-                // leave whichever finished last on screen, not the one that is selected.
-                guard self.range == wanted else { self.chartLoading = false; self.loadChart(); return }
-                self.uploads = hist
-                self.chartLoading = false
             }
         }
     }
@@ -274,15 +260,25 @@ final class Monitor: ObservableObject {
             // reading honest in both directions.
             bytesPerSecond = max(drained, wired) / dt
 
+            // Whole-machine wire traffic is deliberately NOT part of this. It cannot tell
+            // Photos apart from a browser tab, so any web page kept the stall timer alive and
+            // a stalled sync was reported as healthy indefinitely. The daemon's own CPU is
+            // the signal that belongs to Photos: a queue that has not moved while
+            // cloudphotod sits at zero is a stall, and a queue that has not moved while it
+            // works is just a large file mid-flight.
             let moved = prev.queueBytes != snap.queueBytes
                      || prev.queueFiles != snap.queueFiles
-                     || wired > 256 * 1024
+                     || (snap.daemonCPU ?? 0) > 1.0
             if moved { lastProgressAt = snap.date }
         }
 
         history.record(queueBytes: snap.queueBytes, at: snap.date)
         snapshot = snap
         phase = derivePhase(snap)
+        maybeAutoRestart()
+        Log.write("phase=\(phase) idle=\(Int(Date().timeIntervalSince(lastProgressAt)))s "
+                + "cpu=\(snap.daemonCPU.map { String(format: "%.1f", $0) } ?? "nil") "
+                + "files=\(snap.queueFiles)")
         menuBarLabel = (snap.isClear || phase == .unknown) ? nil : Fmt.bytes(snap.queueBytes)
     }
 
@@ -298,35 +294,89 @@ final class Monitor: ObservableObject {
 
     // MARK: - actions
 
+    /// Restart a stall without being asked, when the user has opted in.
+    ///
+    /// The sync here dies within minutes of every restart, so a job measured in days cannot
+    /// be finished by hand. Gated on the same preconditions as the button, plus a cooldown:
+    /// without one, a sync that stalls again immediately would drive Photos' controls
+    /// continuously.
+    private func maybeAutoRestart() {
+        guard autoRestart, phase == .stuck, action == .idle,
+              Date().timeIntervalSince(lastAutoRestart) > 300,
+              AXIsProcessTrusted(), snapshot?.photosRunning == true else { return }
+        lastAutoRestart = Date()
+        autoRestarts += 1
+        Log.write("auto-restart #\(autoRestarts)")
+        restartBackup()
+    }
+
     /// The fix that reliably revives a stalled sync: Photos runs backup as a background
     /// task the scheduler starves, and Pause/Resume restarts it as a user-initiated one.
     func restartBackup() {
-        let script = """
-        tell application "System Events"
-          tell process "Photos"
-            try
-              click (first button of front window whose name contains "Pause")
-              delay 8
-              click (first button of front window whose name contains "Resume")
-            end try
-          end tell
-        end tell
-        """
+        guard action == .idle else { return }
+        // Checked up front rather than discovered through a failure: without Accessibility
+        // this cannot press anything, and saying so immediately beats a spinner that ends
+        // in an error six seconds later.
+        guard AXIsProcessTrusted() else {
+            action = .failed("Halo needs Accessibility permission to press Pause and Resume in "
+                           + "Photos for you. Grant it, then try again.", canFix: true)
+            return
+        }
+        guard snapshot?.photosRunning == true else {
+            action = .failed("Photos needs to be open for this. Open it and try again.",
+                             canFix: false)
+            return
+        }
+        action = .running("Pausing the backup")
+
         Task.detached {
-            LibraryReader.shell("/usr/bin/osascript", ["-e", script])
-            await MainActor.run { self.lastProgressAt = Date(); self.refresh() }
+            if let e = Self.click("Pause") {
+                await MainActor.run { self.action = Self.failure(e) }
+                return
+            }
+            await MainActor.run { self.action = .running("Waiting, then resuming") }
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            let e = Self.click("Resume")
+            await MainActor.run {
+                if let e { self.action = Self.failure(e) }
+                else { self.action = .idle; self.lastProgressAt = Date() }
+                self.refresh()
+            }
         }
     }
 
-    func restartService() {
-        let uid = getuid()
-        Task.detached {
-            LibraryReader.shell("/bin/launchctl",
-                ["kickstart", "-k", "gui/\(uid)/com.apple.cloudphotod"])
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            await MainActor.run { self.lastProgressAt = Date(); self.refresh() }
-        }
+    /// Click a button in Photos' window by name, in-process.
+    ///
+    /// Deliberately not `osascript`: shelling out makes that child process the sender of the
+    /// Apple Event, so macOS checks *its* Accessibility permission, not Halo's. The grant the
+    /// user gives Halo can never apply, and the call fails with -1719 forever.
+    nonisolated private static func click(_ button: String) -> NSDictionary? {
+        let src = """
+        tell application "System Events" to tell process "Photos" ¬
+          to click (first button of front window whose name contains "\(button)")
+        """
+        var err: NSDictionary?
+        NSAppleScript(source: src)?.executeAndReturnError(&err)
+        return err
     }
+
+    nonisolated private static func failure(_ err: NSDictionary) -> ActionState {
+        let code = err[NSAppleScript.errorNumber] as? Int ?? 0
+        let msg = err[NSAppleScript.errorMessage] as? String ?? ""
+        if code == -1719 || msg.contains("assistive access") {
+            return .failed("Halo needs Accessibility permission to press Pause and Resume in "
+                         + "Photos. Grant it, then try again.", canFix: true)
+        }
+        return .failed("Couldn't find Pause in the Photos window. Do it by hand: "
+                     + "Photos › Settings › iCloud, press Pause, then Resume.", canFix: false)
+    }
+
+    func openAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string:
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
+    func dismissAction() { action = .idle }
 
     func openPhotos() {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Photos.app"))
@@ -410,4 +460,9 @@ enum Palette {
     static let wait = Color(red: 0.95, green: 0.68, blue: 0.29)
     static let stop = Color(red: 1.00, green: 0.43, blue: 0.38)
     static let warm = Color(red: 0.96, green: 0.65, blue: 0.31)
+}
+
+extension Array {
+    /// Nil rather than [], so an empty result can be handled with `guard let`.
+    var nonEmpty: Self? { isEmpty ? nil : self }
 }

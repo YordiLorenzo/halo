@@ -100,18 +100,36 @@ struct HistoryStore {
         var label: String {
             switch self { case .hour: "last hour"; case .day: "last 24 hours"; case .week: "last week" }
         }
-        var bucket: LibraryReader.Bucket {
-            switch self { case .hour: .minute; case .day: .hourly; case .week: .sixHour }
-        }
-        /// How to describe one bar when hovering it.
-        var barLabel: String {
-            switch self { case .hour: "minute"; case .day: "hour"; case .week: "6 hours" }
+        /// Chosen so each range draws a comparable number of bars.
+        var bucketSeconds: Int {
+            switch self { case .hour: 120; case .day: 3600; case .week: 21600 }
         }
     }
 
     func series(_ range: Range, now: Date = Date()) -> [Sample] {
         let cutoff = now.timeIntervalSince1970 - range.seconds
         return samples.filter { $0.t >= cutoff }
+    }
+
+    /// Bytes cleared per bucket across the window, for the chart.
+    ///
+    /// Same source as every other figure on the card. Deriving the bars from iCloud's
+    /// per-asset acknowledgements instead put a count of new registrations next to a byte
+    /// total measuring actual transfer, and once a library is mostly registered those two
+    /// stop resembling each other.
+    func drainSeries(_ range: Range, now: Date = Date()) -> [(date: Date, bytes: Int64)] {
+        let s = series(range, now: now)
+        guard s.count >= 2 else { return [] }
+        let size = range.bucketSeconds
+        var out: [(date: Date, bytes: Int64)] = []
+        var prev = s[0]
+        for bucket in stride(from: (s[0].t / Double(size)).rounded(.down) * Double(size),
+                             through: now.timeIntervalSince1970, by: Double(size)) {
+            guard let last = s.last(where: { $0.t < bucket + Double(size) }) else { continue }
+            out.append((Date(timeIntervalSince1970: bucket), max(0, prev.q - last.q)))
+            prev = last
+        }
+        return out
     }
 
     /// Bytes cleared over the window, the number that answers "did last night go well?".

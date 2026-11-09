@@ -11,5 +11,7 @@
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <!-- menu bar only: no Dock icon, no main window -->
   <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Halo restarts a stalled iCloud upload by pressing Pause and Resume in Photos for you.</string>
   <key>NSHumanReadableCopyright</key><string>Halo</string>
 </dict></plist>

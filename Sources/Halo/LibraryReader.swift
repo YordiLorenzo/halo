@@ -154,147 +154,11 @@ enum LibraryReader {
         // footprint so the monitor never becomes the bottleneck it is reporting on.
         s.walBytes = fileSize(photosDB.appendingPathExtension("wal"))
 
-        s.uploads = uploadStats(library: library)
-
-        s.daemonRunning = isRunning("cloudphotod")
+        s.daemonCPU     = processCPU("cloudphotod")
+        s.daemonRunning = s.daemonCPU != nil
         s.photosRunning = isRunning("Photos")
         s.wireOutBytes  = interfaceBytesOut()
         return s
-    }
-
-    /// Real upload history, straight from the sync engine.
-    ///
-    /// `idMapping` maps a local record to its cloud identifier, and a row appears the
-    /// moment iCloud confirms one, so `addTimestamp` is when that item actually landed.
-    /// Photos itself keeps no upload log and its own UI cannot show a trend, but this
-    /// table has one going back to the library's creation. It survives app reinstalls
-    /// and needs no observation period: the past is already there.
-    static func uploadHistory(library: URL, bucket: Bucket) -> [(date: Date, count: Int)] {
-        let store = library.appendingPathComponent(
-            "resources/cpl/cloudsync.noindex/storage/store.cloudphotodb")
-        var out: [(Date, Int)] = []
-        withReadOnly(store) { db in
-            let sql = """
-                SELECT CAST(addTimestamp / \(bucket.seconds) AS INTEGER) * \(bucket.seconds),
-                       count(*)
-                FROM idMapping
-                WHERE addTimestamp IS NOT NULL AND addTimestamp > ?1
-                GROUP BY 1 ORDER BY 1
-            """
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
-            defer { sqlite3_finalize(stmt) }
-            // Apple epoch: seconds since 2001-01-01.
-            let cutoff = Date().timeIntervalSince1970 - 978_307_200 - bucket.span
-            sqlite3_bind_double(stmt, 1, cutoff)
-            while sqlite3_step(stmt) == SQLITE_ROW, let stmt {
-                let t = sqlite3_column_double(stmt, 0) + 978_307_200
-                out.append((Date(timeIntervalSince1970: t),
-                            Int(sqlite3_column_int64(stmt, 1))))
-            }
-        }
-        return out
-    }
-
-    /// Bucket size and window are chosen together, asking for hourly buckets over a
-    /// one-hour window gives a single bar, which is why the range switch appeared dead.
-    struct Bucket {
-        let seconds: Int
-        let span: TimeInterval
-        static let minute = Bucket(seconds: 60,    span: 3600)          // 1H  → 60 bars
-        static let hourly = Bucket(seconds: 3600,  span: 86400)         // 24H → 24 bars
-        static let sixHour = Bucket(seconds: 21600, span: 604_800)      // 7D  → 28 bars
-    }
-
-    /// Full integrity check. Minutes on a large library, so this is only ever run when
-    /// the user explicitly asks, never on the polling path.
-    /// What iCloud has confirmed receiving, per window, from the sync engine's own record.
-    ///
-    /// The alternative is watching the queue shrink, but that only measures the app's uptime:
-    /// on a fresh launch "last week" and "last day" hold the same few hours and print the same
-    /// number. `idMapping` is retroactive, so the figure is right the moment the app opens.
-    ///
-    /// `coverageStart` is the oldest mapping on file. The table does not always go back
-    /// forever, since a Photos library repair rebuilds it, so a window reaching further back
-    /// than this is reporting a partial total and the UI has to say so.
-    ///
-    /// A rebuild also remaps everything already in iCloud in one burst, and those rows carry
-    /// the rebuild's timestamp rather than the original upload's. Counting them would report
-    /// a library's worth of bytes as a single hour's throughput, so the opening burst is
-    /// dropped: genuine uploads trickle in, they do not arrive twelve thousand at once.
-    struct UploadStats {
-        var hour: Int64 = 0
-        var day: Int64 = 0
-        var week: Int64 = 0
-        var coverageStart: Date?
-    }
-
-    static func uploadStats(library: URL) -> UploadStats {
-        let cpl = library.appendingPathComponent(
-            "resources/cpl/cloudsync.noindex/storage/store.cloudphotodb")
-        let photos = library.appendingPathComponent("database/Photos.sqlite")
-        var out = UploadStats()
-        let now = Date().timeIntervalSince1970 - 978_307_200
-        let weekAgo = now - 604_800
-
-        withReadOnly(cpl) { db in
-            // Doubling apostrophes, because a library can legitimately live somewhere like
-            // /Volumes/Someone's Drive and an unescaped path makes ATTACH fail silently.
-            let quoted = photos.path.replacingOccurrences(of: "'", with: "''")
-            guard sqlite3_exec(db, "ATTACH DATABASE 'file:\(quoted)?mode=ro' AS p",
-                               nil, nil, nil) == SQLITE_OK else { return }
-
-            // Where the usable record starts. A rebuild remaps thousands of already-uploaded
-            // assets in one burst, so anything inside that burst is skipped. The burst has to
-            // be identified rather than assumed: a small library can legitimately finish its
-            // first batch within the same window, and a blanket cutoff would erase it.
-            var from = -Double.greatestFiniteMagnitude
-            query(db, """
-                SELECT MIN(addTimestamp),
-                       (SELECT count(*) FROM idMapping WHERE addDirection = 1
-                        AND addTimestamp < (SELECT MIN(addTimestamp) + 120 FROM idMapping
-                                            WHERE addDirection = 1))
-                FROM idMapping WHERE addDirection = 1
-            """) { row in
-                guard sqlite3_column_type(row, 0) != SQLITE_NULL else { return }
-                let first = sqlite3_column_double(row, 0)
-                let burst = sqlite3_column_int64(row, 1) > 500
-                from = burst ? first + 120 : first
-                out.coverageStart = Date(timeIntervalSince1970: from + 978_307_200)
-            }
-
-            // addDirection 1 is device to cloud. Without it, assets arriving *from* iCloud are
-            // counted as uploads, so a Mac doing an initial download reports large outbound
-            // figures while sending nothing.
-            //
-            // Resource type 0 with subtype above 1 is a locally generated preview that never
-            // occupies iCloud, matching the exclusion the library-size query already makes.
-            //
-            // Bounded to the widest window on display: this runs on every poll, and scanning
-            // the whole history each time is how a monitor starts holding read locks long
-            // enough to stop the WAL checkpointing.
-            let sql = """
-                SELECT COALESCE(SUM(CASE WHEN t > \(now - 3600)  THEN sz ELSE 0 END), 0),
-                       COALESCE(SUM(CASE WHEN t > \(now - 86400) THEN sz ELSE 0 END), 0),
-                       COALESCE(SUM(sz), 0)
-                FROM (SELECT m.addTimestamp t,
-                             (SELECT SUM(r.ZDATALENGTH) FROM p.ZINTERNALRESOURCE r
-                              JOIN p.ZASSET a ON a.Z_PK = r.ZASSET
-                              WHERE a.ZUUID = m.localIdentifier
-                                AND (r.ZRESOURCETYPE IN (1,4)
-                                     OR (r.ZRESOURCETYPE = 0 AND r.ZDATASTORESUBTYPE = 1))) sz
-                      FROM idMapping m
-                      WHERE m.addDirection = 1
-                        AND m.addTimestamp > \(weekAgo)
-                        AND m.addTimestamp >= \(from))
-            """
-            query(db, sql) { row in
-                out.hour = sqlite3_column_int64(row, 0)
-                out.day  = sqlite3_column_int64(row, 1)
-                out.week = sqlite3_column_int64(row, 2)
-            }
-        }
-        return out
     }
 
     static func checkIntegrity(library: URL) -> Bool {
@@ -406,6 +270,20 @@ enum LibraryReader {
             .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
+    /// CPU percentage for a process, or nil when it is not running.
+    ///
+    /// Needed because whole-machine network traffic cannot tell Photos apart from a browser
+    /// tab, so it is useless as a liveness signal for this one daemon.
+    static func processCPU(_ name: String) -> Double? {
+        guard let out = shell("/bin/ps", ["-Aco", "pid=,%cpu=,comm="]) else { return nil }
+        for line in out.split(separator: "\n") {
+            let f = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard f.count >= 3, f[2...].joined(separator: " ") == name else { continue }
+            return Double(f[1])
+        }
+        return nil
+    }
+
     /// Bytes sent on the default interface. Locate `Obytes` from the header rather than a
     /// fixed column, a tunnel interface has no MAC address, which shifts every later
     /// field left by one and silently reads `Coll` (always zero) instead.
@@ -432,15 +310,27 @@ enum LibraryReader {
 
     @discardableResult
     static func shell(_ launchPath: String, _ args: [String]) -> String? {
+        run(launchPath, args).out
+    }
+
+    /// Same, but keeps stderr and the exit status.
+    ///
+    /// Discarding stderr is how the restart button came to fail silently for a week: the
+    /// AppleScript it runs cannot touch Photos without Accessibility permission, and the
+    /// refusal went to a null device.
+    static func run(_ launchPath: String, _ args: [String]) -> (out: String?, err: String, ok: Bool) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launchPath)
         p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let outPipe = Pipe(), errPipe = Pipe()
+        p.standardOutput = outPipe
+        p.standardError = errPipe
+        do { try p.run() } catch { return (nil, "\(error)", false) }
+        let o = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let e = errPipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        return String(data: data, encoding: .utf8)
+        return (String(data: o, encoding: .utf8),
+                String(data: e, encoding: .utf8) ?? "",
+                p.terminationStatus == 0)
     }
 }
